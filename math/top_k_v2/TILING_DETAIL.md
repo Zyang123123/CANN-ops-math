@@ -358,8 +358,8 @@ modeType = MULT_CORE_OPTIM_MODE (4)
 初始tileSize = 7680(非64位) 或 5120(64位)
 
 计算运行时空间 (GetTopkMultiCoreRunTimeNeedSpace):
-  = BIN_NUM × indexDtypeSize × lastDimTileNumTimes  // tile直方图
-  + 2 × ceilAlign(sizeof(uint32_t) × lastDimTileNumTimes)  // tileTopK值
+  = BIN_NUM × indexDtypeSize × lastDimTileNumTimes  // tile直方图--BIN_NUM桶个数
+  + 2 × ceilAlign(sizeof(uint32_t) × lastDimTileNumTimes)  // tileTopK值--每个tile内的topk的个数
   + (dtypeSize×2 + indexDtypeSize + indexToDtypeSize) × tileSize  // 主要数据空间
 
 while (topkAcApiNeedBuffer + needSpace > ubSizePlatForm):
@@ -372,18 +372,18 @@ while (topkAcApiNeedBuffer + needSpace > ubSizePlatForm):
 sortedDimParallelData = (tileSize × maxCoreNum) / 2
 
 if lastAxisNum ≤ sortedDimParallelData:
-    → Medium模式: 排序轴不算特别大，外轴和排序轴都能分配核
+    → Medium模式: 排序轴不算特别大，外轴和排序轴都能分配核（几行一起所有核处理）
 else:
-    → Big模式: 排序轴很大，所有核都用来处理排序轴
+    → Big模式: 排序轴很大，所有核都用来处理排序轴（一行所有核处理）
 ```
 
 #### Medium模式 (`TileModeMediumSize`)
 
 ```
-lastDimTileNum = ceil(lastAxisNum / tileSize)
-unsortedDimParallel = maxCoreNum / lastDimTileNum    // 外轴分到的核数
-coreNumNeed = lastDimTileNum × unsortedDimParallel
-sortLoopTimes = ceil(unsortedDimNum / unsortedDimParallel)
+lastDimTileNum = ceil(lastAxisNum / tileSize)   //  内轴需要几个核
+unsortedDimParallel = maxCoreNum / lastDimTileNum    // 外轴几行一起干活
+coreNumNeed = lastDimTileNum × unsortedDimParallel    //  同一时刻多少核在干活
+sortLoopTimes = ceil(unsortedDimNum / unsortedDimParallel)  //  需要多少轮
 ```
 
 核分配示意（假设 maxCoreNum=8, lastDimTileNum=2）：
@@ -399,7 +399,7 @@ sortLoopTimes = ceil(unsortedDimNum / unsortedDimParallel)
 
 ```
 lastDimTileNum = ceil(lastAxisNum / tileSize)
-coreNumNeed = min(maxCoreNum, lastDimTileNum)
+coreNumNeed = min(maxCoreNum, lastDimTileNum) //  每一行单独同时处理
 sortLoopTimes = unsortedDimNum    // 每行独立处理
 unsortedDimParallel = 1           // 所有核只处理排序轴
 ```
@@ -501,7 +501,7 @@ keyParams1 = ceil(allNumExcusiveBin / keyParams4)
 | 模式 | Workspace组成 |
 |------|-------------|
 | SINGLE_CORE_MODE | `lastDimTileNum × 256 × unsortedDimParallel × indexTypeSize` |
-| MULT_CORE_OPTIM_MODE | `ceilAlign(dtypeSize × factor × K) + ceilAlign(sizeof(int32_t) × factor × K)` |
+| MULT_CORE_OPTIM_MODE | `ceilAlign(dtypeSize × factor × K) + ceilAlign(sizeof(int32_t) × factor × K)` ；`Factor = lastDimTileNum * unsortedDimParallel;`|
 | 其他模式(MULT_CORE等) | `256 × indexTypeSize × unsortedDimParallel + 2 × ceilAlign(lastDimTileNum × indexTypeSize × unsortedDimParallel)` |
 
 ### 5.2 SortAndTopK Workspace
@@ -843,3 +843,116 @@ NVIDIA 的库（cuDNN、cuBLAS、TensorRT）内部**确实有类似 Ascend Tilin
 1. **硬件调度器**承担了核分配 —— CUDA 有，Ascend 没有
 2. **Kernel 代码内部**承担了数据分块 —— CUDA 的 `__shared__` + threadIdx，Ascend 则交给 host 端 Tiling
 3. Ascend 因为**没有硬件调度器 + UB 更受限**，所以必须把调度逻辑提到 host 端作为显式的一层
+
+---
+
+## 12. 各模式选择策略详细对照表
+
+> 本节以代码实际判断顺序为基准，给出每种模式的精确触发条件、关键参数和适用场景。
+> 决策严格按优先级 ① → ⑦ 顺序，命中即返回，不会再走下一个模式。
+
+### 12.1 主决策表（精确触发条件）
+
+| 优先级 | 模式名 | modeType 常量 | TilingKey 规则 | 数据类型限制 | 精确触发条件（按代码 AND 关系） | 失败兜底条件 |
+|:---:|:---|:---:|:---:|:---|:---|:---|
+| ① | **SmallSizeMergeSort** | 3（隐式） | `dataTypeKey + 10000` | `optDataTypeBitMap` 命中：float / float16 / bfloat16 | `lastAxisNum ≤ 1024` **AND** `dataType ∈ {F32, F16, BF16}` | 不命中类型或 N > 1024 时进入② |
+| ② | **SingleBlock** | 3（同上） | `dataTypeKey`（无偏移） | 全部 11 种类型 | `ComputeSingleBlockTileData() > 0` **AND** `tileSize ≥ lastAxisNum`（UB 能装下整行 + TopK API 临时空间） | UB 装不下整行 → 进入③ |
+| ③a | **Fp32MergeMoreCore** | 6 | `23003`（float 专用） | 仅 `DT_FLOAT` | `dataType == F32` **AND** `kValue > 0` **AND** `0.25 ≤ K/N < 0.50` **AND** `onceMaxElements ≥ 32` **AND** `splitCoreNum = ⌈N/2048⌉ ∈ (1, maxCoreNum]` **AND** `unsortedDimNum × splitCoreNum ≤ maxCoreNum` | 核数不够 → 进入③b |
+| ③b | **Fp32MergeIntraCore** | 7 | `33003`（float 专用） | 仅 `DT_FLOAT` | ③a 未命中 **AND** `dataType == F32` **AND** `unsortedDimNum ≥ maxCoreNum/2` **AND** `kValue > 0` **AND** `0.25 ≤ K/N < 0.50` **AND** `!(isSort==false && kValue ≤ 2000)` **AND** `1 < blocksPerRow = ⌈N/blockSortSize⌉ ≤ 256` | K 太小且不需排序 → 进入④ |
+| ④ | **SingleCore** | 1 | `dataTypeKey` | 全部 11 种类型 | `unsortedDimNum ≥ maxCoreNum`（外轴 ≥ 核数） **AND** `ComputeSingleCoreTileData() > 0`（UB 能找到合适 tileSize） | 外轴 < 核数或 UB 算不出 → 进入⑤ |
+| ⑤ | **MultiCoreOptim** | 4 | `dataTypeKey` | 全部 11 种类型 | `tileData 默认值 > kValue` **AND** 迭代搜索到合法 tileSize **AND** `kValue × lastDimTileNum ≤ tileSize` **AND** `tileSize ≥ lastAxisNum` | K 太大或搜索失败 → 进入⑥ |
+| ⑥ | **MultiCore（Medium/Big）** | 2 | `dataTypeKey` | 全部 11 种类型 | `lastAxisNum < 10,000,000`（SORT_AND_TOP_K_THRESHOLD） **AND** `ComputeTopkRadixMoreCoreTileData() > 0`（UB 能算出 tileSize） | N ≥ 10M 或 UB 不够 → 进入⑦ |
+| ⑦ | **SortAndTopK**（兜底） | 5 | `dataTypeKey` | 全部 11 种类型 | 以上 6 种全部未命中 | 无（最终路径） |
+
+> 注：`N` = `lastAxisNum`，`K` = `kValue`，`unsortedDimNum` = 外轴总大小。
+
+### 12.2 资源使用对比表
+
+| 模式 | 默认起始 tileSize | tileSize 递减步长 | Workspace 占用 | 双缓冲 | 核数策略 |
+|:---|:---:|:---:|:---|:---:|:---|
+| ① SmallSizeMergeSort | 7680（TMP_DATA_NUM） | +256 增大到合适数（向 70% 核利用率看齐） | 无（全在 UB 内） | N < 2048 时开启 | 按行均摊，最多满核 |
+| ② SingleBlock | 15360 / 10240（b64） | 256 | 无（仅 UB+TopK API 临时） | N < 2048 时开启 | 满核运行 |
+| ③a Fp32MergeMoreCore | — | — | `unsortedDimNum × alignInput × 8B × 2`（DoubleBuffer） | 启用 | `unsortedDimNum × splitCoreNum` |
+| ③b Fp32MergeIntraCore | blockSortSize / extractChunkSize | 32 对齐 | 较少 | 启用 | `min(maxCoreNum, unsortedDimNum)` |
+| ④ SingleCore | 15360（SINGLE_CORE_DATA_NUM） | 256（BIN_NUM） | 无 | N < 2048 时开启 | 单核串行处理整行 |
+| ⑤ MultiCoreOptim | 7680 / 5120（b64） | 32（TILE_SIZE_DECREASING_FACTOR） | 无 | 启用 | 满核 + 末轮 K 末位集中 |
+| ⑥ MultiCore | 7680（TMP_DATA_NUM） | 256 | 无 | 启用 | 满核 + 末轮集中 |
+| ⑦ SortAndTopK | 由 SortRadix 子模式决定 | — | 较大（radix 全排序） | 由 Sort 决定 | 满核 |
+
+### 12.3 模式互斥关系矩阵
+
+> 决策是 if-elif 顺序结构，下表表示「如果命中本模式，会跳过哪些后续模式」。
+
+| 命中模式 | 跳过的后续模式 | 原因 |
+|:---|:---|:---|
+| ① SmallSizeMergeSort | ②③④⑤⑥⑦ | 小数据 + 浮点 = 最优路径，无需再判 |
+| ② SingleBlock | ③④⑤⑥⑦ | UB 能装整行，没必要走 Merge/Radix |
+| ③a Fp32MergeMoreCore | ③b④⑤⑥⑦ | F32 + K/N ∈ [0.25, 0.5) + 核数够 → 多核归并最优 |
+| ③b Fp32MergeIntraCore | ④⑤⑥⑦ | F32 + K/N ∈ [0.25, 0.5) + 核数不够 → 单核内归并 |
+| ④ SingleCore | ⑤⑥⑦ | 外轴 ≥ 核数 → 单核串行更稳定 |
+| ⑤ MultiCoreOptim | ⑥⑦ | K 末位集中策略能省一次 TopK API |
+| ⑥ MultiCore | ⑦ | 经典多核 Radix Select |
+| ⑦ SortAndTopK | — | 兜底，无下一级 |
+
+### 12.4 典型场景触发示例
+
+假设硬件为 `coreNum = 32`、UB ≈ 192KB（已扣 SIMT 32KB）：
+
+| 输入场景 | N (lastAxis) | K | unsortedDim | dataType | sorted | 命中模式 | 触发原因 |
+|:---|:---:|:---:|:---:|:---|:---:|:---|:---|
+| Transformer 注意力小尾轴 | 128 | 5 | 4096 | float16 | true | **①** | N ≤ 1024 + F16 |
+| 小 LLM logits | 512 | 10 | 2048 | float | false | **①** | N ≤ 1024 + F32 |
+| 嵌入层检索 | 4096 | 100 | 8192 | float | true | **②** | UB 能装 4096 × 4B = 16KB |
+| 推荐排序 | 10000 | 50 | 100000 | float | false | **③a 或 ③b** | K/N = 0.005 不命中（< 0.25），落入 ④/⑤ |
+| 中等规模检索 | 5000 | 1500 | 5000 | float | true | **③a** | K/N = 0.3 ∈ [0.25, 0.5) + splitCoreNum = 3 ≤ 32 |
+| 同上但 unsorted=10 | 5000 | 1500 | 10 | float | true | **③b** | ③a 核数不够（10×3=30，但 unsortedDimNum=10 偏小走核内） |
+| 普通多核场景 | 8192 | 100 | 65536 | int32 | false | **④** | unsortedDim(65536) ≥ 32 → 单核更稳 |
+| 大 K 占比 | 20000 | 5000 | 1000 | int8 | true | **⑤** | K=5000, tileSize 需 ≥ K × lastDimTileNum |
+| 经典 TopK | 100000 | 100 | 1000 | float16 | false | **⑥** | N < 10M + UB 算得出 tileSize |
+| 超大词表 | 20000000 | 10 | 1 | int32 | false | **⑦** | N ≥ 10M → 兜底完整排序 |
+
+### 12.5 关键常量速查表
+
+| 常量名 | 值 | 含义 | 影响模式 |
+|:---|:---:|:---|:---|
+| `SMALL_MAX_DATA_SZIE` | 1024 | SmallSize 模式的 N 上限 | ① |
+| `SINGLE_BLOCK_DATA_NUM` | 15360 | SingleBlock 默认 tileSize | ② |
+| `SINGLE_BLOCK_DATA_NUM_B64` | 10240 | 64 位类型默认 tileSize | ② |
+| `SINGLE_CORE_DATA_NUM` | 15360 | SingleCore 默认 tileSize | ④ |
+| `TMP_DATA_NUM` | 7680 | MultiCoreOptim / MergeSort 默认 tileSize | ① ⑤ ⑥ |
+| `TMP_DATA_NUM_B64` | 5120 | 64 位类型默认 tileSize | ⑤ |
+| `TILE_SIZE_DECREASING_FACTOR` | 32 | MultiCoreOptim 迭代递减步长 | ⑤ |
+| `BIN_NUM` | 256 | Radix 桶数（也作递减步长） | ④ ⑥ |
+| `FP32_K_LAST_AXIS_LOWER_RATIO` | 0.25 | F32 Merge 模式 K/N 下限 | ③ |
+| `FP32_K_LAST_AXIS_UPPER_RATIO` | 0.50 | F32 Merge 模式 K/N 上限 | ③ |
+| `MERGE_MORE_CORE_ONE_CORE_DATA_SIZE` | 2048 | F32 多核 Merge 单核数据量 | ③a |
+| `MERGE_INTRA_CORE_SORT_ALIGN` | 32 | F32 核内 Merge 对齐粒度 | ③a ③b |
+| `SORT_AND_TOP_K_THRESHOLD` | 10,000,000 | SortAndTopK 兜底触发线 | ⑥ ⑦ |
+| `SUPPORT_SORT_MAX_SIZE` | 2000 | 不需排序的 K 上限（F32 核内走 Radix 更快） | ③b |
+| `CONST_SIMT_SPACE` | 32768 | UB 预留给 SIMT 的空间 | 全部 |
+| `MERGE_SORT_TILING_OFFSET` | 10000 | Merge 模式 TilingKey 偏移 | ① |
+
+### 12.6 决策流程伪代码（精简版）
+
+```cpp
+TopKV2Tiling() {
+    if (IsSmallSizeMergeSortMode(dataType, N))       return TileModeSmallSizeOptim();   // ①
+    if (IsSingleBlockMode(...))                      return TileModeSmallSize();        // ②
+    if (IsFp32MergeSortMode(...)) {
+        if (IsTopkMergeSortMoreCoreFp32Mode(...))    return GetTopkMergeMoreCoreFp32(); // ③a
+        if (IsTopkMergeSortIntraCoreFp32Mode(...))   return GetTopkMergeIntraCoreFp32();// ③b
+    }
+    if (IsSingleCoreMode(...))                       return TileModeSingleCore();       // ④
+    if (IsMultiCoreOptimMode(...))                   return TileMultiCoreOptimSize();   // ⑤
+    if (IsTopkRadixMoreCoreMode(...))                return TileTopkMoreCoreMode();     // ⑥
+    return TileModeSortAndTopK();                                                       // ⑦ 兜底
+}
+```
+
+### 12.7 表格使用指引
+
+- **要查 N 多大走哪个模式** → 看 12.1 表的「精确触发条件」列 + 12.4 示例
+- **要查为什么没走到某模式** → 看 12.3 互斥关系
+- **要查 UB 算到多少 tileSize** → 看 12.2 资源使用表
+- **要查常量数值** → 看 12.5 速查表
+- **要看完整调用顺序** → 看 12.6 伪代码
