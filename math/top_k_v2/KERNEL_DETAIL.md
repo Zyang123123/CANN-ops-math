@@ -638,3 +638,216 @@ TopK V2 Kernel 侧的设计要点：
 5. **SortWithIndex 后处理**：K > 2000 的排序需求独立成模块，复用 Sort 库
 6. **UB 精算**：每个模板的 UB 分配严格匹配 Tiling 层计算的 tileSize
 7. **流水与同步**：`PipeBarrier<PIPE_ALL>` + `SyncAll` + `SetFlag/WaitFlag` 确保核间/流水正确性
+
+---
+
+## 15. AscendC::TopK 深入解析
+
+### 15.1 为什么 `StoreFinalAnswer2Gm` 要再调一次 `AscendC::TopK`
+
+#### 问题背景
+
+`radix_sort_top_k.h:845` 的 `StoreFinalAnswer2Gm` 函数在主循环结束后调用了一次
+`AscendC::TopK` (`:877, 888`)。表面看「RadixSelect 已经做完 TopK,为什么收尾时还要再做一遍?」
+
+#### 核心原因:RadixSelect 给出的候选数 ≠ K
+
+`ProcessMultiBlockTopK` 多 pass radix 之后,把所有「字节前缀 ≥ boundaryBin」的元素写入
+`tileTopkValueGm`。但 radix 按 **256 个 bin** 切分,边界 bin 内通常有多个元素共享相同字节前缀,
+radix 无法进一步区分。
+
+```
+   主循环结束时的候选区 tileTopkValueGm
+   ┌─────────────────────────────────────────────────┐
+   │ elem_0  elem_1  elem_2  ...  elem_M        (M > K) │
+   │  全部 ≥ boundaryBin (字节前缀层面)                  │
+   └─────────────────────────────────────────────────┘
+                       ↑
+              数量通常 > K,因为有 ties
+```
+
+举例: K=10,可能候选有 12 个 (最后 2 个落在边界 bin 上,无法靠 radix 区分谁该留下)。
+
+#### `StoreFinalAnswer2Gm` 必须把 M 个候选**精确截到 K 个**
+
+这就是 `:877` 调用 `AscendC::TopK` 的目的:
+
+```cpp
+AscendC::TopK<T, false, false, false, TopKMode::TOPK_NORMAL, topkConfig>(
+    topkValueOutLocal,            // ← 输出: 精确 K 个 value
+    topkValueOutIndexLocal,       // ← 输出: 精确 K 个 index
+    inputLocalTensor,             // ← 输入: M 个候选 (M > K)
+    topkSrcIndexLocal,            // ← 输入: 候选的局部 index
+    emptyFinishLocal,
+    shareTmpBuffer,
+    static_cast<int32_t>(tileTopkValue_(tileTopkValueIndex)),  // ← K
+    emptyTopkTiling, topKInfo,
+    IS_LARGEST);
+```
+
+`tileTopkValue_(tileTopkValueIndex)` 就是这个 tile 该输出的精确 K 值 (Host Tiling 算好)。
+
+#### 为什么用 `AscendC::TopK` 而不是再做一轮 radix
+
+| 考虑 | RadixSelect 主循环 | StoreFinalAnswer2Gm 收尾 |
+|---|---|---|
+| 数据规模 | N (整个 lastDim,可能上百万) | M (候选数,通常 ≤ 几千) |
+| 精度要求 | 粗筛 (按字节 bin) | **精确 K** |
+| 跨核同步 | 需要 (atomic on globalHistGm) | 不需要 (本核候选,核内独立) |
+| 适用算法 | 多 pass radix (适合大数据) | **硬件 TopK IP** (小数据 + 精确边界) |
+
+Ascend 的 `AscendC::TopK` 是一个**专用 radix-select 引擎**,设计目标就是
+"从 N 个里精确取 K 个",直接对应这个收尾需求。
+
+#### `StoreFinalAnswer2Gm` 顺带做的其它收尾工作
+
+```cpp
+// 1. 对齐 padding (避免 AlignN 后的多余元素干扰 TopK)
+T defaultValue = IS_LARGEST ? GetTypeMinValue<T>() : GetTypeMaxValue<T>();
+for(int i = 0; i < gapValue; i++) {
+    inputLocalTensor(nowTileSize + i) = defaultValue;   // :872-873
+}
+
+// 2. 局部 index → 全局 index
+int32_t indexStride = tileId * numTileData_;
+AscendC::Adds(topkValueOutIndexLocal, topkValueOutIndexLocal, indexStride, nowTileSize);  // :883
+
+// 3. int32 → int64 (如果 T_INDEX_TO 是 int64)
+AscendC::Cast<int64_t, int32_t>(topkValueOutIndexLocal, topkValueOutIndexTmp, ...);  // :892
+```
+
+#### 完整流程回顾
+
+```
+ProcessMultiBlockTopK (radix 多 pass)
+    ↓ 产出: tileTopkValueGm 上 M 个候选 (M > K)
+StoreFinalAnswer2Gm
+    ├─ DataCopyPad: GM→UB (取候选)
+    ├─ Padding 对齐
+    ├─ AscendC::TopK ← 精确截到 K 个  ★ 关键步骤
+    ├─ Adds: 局部 idx → 全局 idx
+    ├─ Cast: int32 → int64 (可选)
+    └─ CopyTopkValue2Gm: UB→GM (写最终答案)
+(可选) SortTopKRes
+    └─ AscendC::Sort (sorted=true 时按值再排序一遍)
+```
+
+**一句话总结**: RadixSelect 是「粗筛 + 多核加速」,`AscendC::TopK` 在收尾时是
+「精筛 + 单核收口」,两者是分工互补的关系,不是重复劳动。
+
+---
+
+### 15.2 `AscendC::TopK` 源码实现位置
+
+> **重要更正 (2026-06-16)**: 本节最初推断 AscendC::TopK 是「闭源 API,源码不在仓库」,
+> 这是**错误的**。源码在本地 `asc-devkit/` 完整可见,详见 `ASCENDC_TOPK_INTERNAL.md`。
+> 下面的旧陈述仅作历史记录,新结论见本节末尾。
+
+#### ~~当前仓库内找不到~~ (已修正)
+
+~~`AscendC::TopK` 属于 AscendC 框架 API,不是 top_k_v2 算子代码。本仓库只
+`#include "kernel_operator.h"` 这个总头文件。当前开发环境上没有安装 CANN toolkit。~~
+
+**修正**: 本地 `asc-devkit/` 仓库已经包含完整 AscendC 源码:
+
+- 头文件: `C:/Users/ziyang/Desktop/CANN/asc-devkit/include/adv_api/sort/`
+  - `topk.h` (334 行,主入口)
+  - `topk_utils.h` / `topk_utils_constants.h` / `topk_tilingdata.h` 等
+- 实现: `C:/Users/ziyang/Desktop/CANN/asc-devkit/impl/adv_api/detail/sort/topk/`
+  - `topk_3510_impl.h` (1417 行,**核心 radix-select**)
+  - `topk_v200_impl.h` / `topk_v220_impl.h` (其它芯片路径)
+  - `topk_common_impl.h` / `topk_common_utils.h` (公共包装)
+
+#### `AscendC::TopK` 实现的真实位置 (修正版)
+
+| 层级 | 位置 | 是否开源 |
+|---|---|---|
+| **API 声明** | `asc-devkit/include/adv_api/sort/topk.h` | **可见** |
+| **模板包装层** | `asc-devkit/include/.../topk.h` (内联) | **可见** |
+| **架构派发** | `topk.h:34-48` 按 `__NPU_ARCH__` 选择 impl | **可见** |
+| **算法实现** | `asc-devkit/impl/.../topk/topk_3510_impl.h` (主循环 `:1157-1284`) | **可见** |
+| **SIMD helper** | `topk_3510_impl.h:544` `GenerateAccumulateData` 等 | **可见** |
+| **底层 intrinsic** | `Histograms<>`, `GatherMask<>`, `Reg::LoadAlign` 等 | 声明可见 |
+| **硬件微码** | AIV Vector 微码 ROM | **闭源 (华为 IP)** |
+
+#### 算法层实际是这样的 (修正版)
+
+```cpp
+// topk.h:81 - 公开模板
+template <typename T, ...>
+__aicore__ inline void TopK(...) {
+    if constexpr (config.algo == TopKAlgo::RADIX_SELECT) {
+        // 派发到 impl 层
+        Reg::RadixSelectTopK::TopKNormal<T, ...>(...);   // topk_3510_impl.h:1289
+    }
+}
+
+// topk_3510_impl.h:1157 - 主算法 (完全可见)
+__aicore__ inline void TopKRaidxSelect(...) {
+    // Twiddle, Initialize, ...
+    for (uint16_t i = typeBytes; i > 0 && remainK > 0; --i) {
+        GenerateAccumulateData<ConvType>(...);           // :1216
+        // GenerateAccumulateData 内部调用硬件 Histograms<> 指令
+        // 二分查找 boundary byte
+    }
+    GatherGreaterAndEqualKData(...);                     // :1248
+    GatherGreaterAndEqualKIndex(...);                    // :1249
+    if (sorted) Sort<...>(...);                          // :1265
+}
+```
+
+**算法逻辑完全可读**,只有最底层的 `Histograms<>` / `GatherMask<>` 等 intrinsic
+最终落到 AIV 微码 (这部分确实闭源)。
+
+#### 替代方案 (历史建议,部分已不适用)
+
+**1. 官方文档 (仍然有效)**
+- Ascend CANN 文档站: `https://www.hiascend.com/document`
+- 关键词搜索: `AscendC TopK API`
+
+**2. ~~开源镜像仓库~~ → 现在直接读本地 asc-devkit**
+- 不用再去 Gitee,本地仓库已经有完整源码
+
+**3. 仓库内已有调用线索** (仍然有效)
+
+| 调用点 | 文件 |
+|---|---|
+| 主路径收尾 | `radix_sort_top_k.h:877, 888` |
+| SingleBlock 模式 | `radix_sort_top_k_single_block.h:160` |
+| SingleCore 模式 | `radix_sort_top_k_single_core.h:461, 477` |
+| InterCoreOptim 模式 | `radix_sort_top_k_inter_core_template_optimization.h:176, 182, 229` |
+
+调用模板统一是:
+
+```cpp
+AscendC::TopK<T, false, false, false, TopKMode::TOPK_NORMAL, topkConfig>(
+    /*out value*/ topkValueOutLocal,
+    /*out index*/ topkValueOutIndexLocal,
+    /*in  value*/ inputLocalTensor,
+    /*in  index*/ topkSrcIndexLocal,
+    /*finish flag*/ emptyFinishLocal,
+    /*tmp buf*/   shareTmpBuffer,
+    /*K*/         static_cast<int32_t>(...),
+    /*tiling*/    emptyTopkTiling,
+    /*info*/      topKInfo,
+    /*order*/     IS_LARGEST);
+```
+
+#### 想自己读源码的步骤 (修正版)
+
+```bash
+# 不需要安装 CANN toolkit,直接读本地仓库
+ls C:/Users/ziyang/Desktop/CANN/asc-devkit/include/adv_api/sort/
+ls C:/Users/ziyang/Desktop/CANN/asc-devkit/impl/adv_api/detail/sort/topk/
+
+# 关键文件:
+# - topk.h (公开 API)
+# - topk_3510_impl.h (3510 系列芯片的 radix-select 实现)
+# - topk_v200_impl.h / topk_v220_impl.h (其它芯片)
+```
+
+#### 一句话总结 (修正版)
+
+`AscendC::TopK` 是一个 **header-only、模板化、按芯片架构派发** 的 AscendC 库,
+**源码在本地 `asc-devkit/` 完整可见**,只有最底层的 `Histograms<>` / `GatherMask<>`
+等向量微码是华为 IP 不开源。详细解读见 **`ASCENDC_TOPK_INTERNAL.md`** (819 行)。
