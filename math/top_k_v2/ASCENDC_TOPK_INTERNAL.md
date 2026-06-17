@@ -224,7 +224,10 @@ AscendC::TopK<T, ...>                                      [topk.h:81]
        │     │     │           ├─ TwiddleInData           [:1194/1203]
        │     │     │           ├─ for byte MSB→LSB:       [:1215]
        │     │     │           │     ├─ GenerateAccumulateData  [:544, __simd_vf__]
-       │     │     │           │     │   └─ Histograms<>  (硬件指令!)
+       │     │     │           │     │   └─ Histograms<>  (硬件指令! `CHISTv2`)
+                                            └─ dhistv2/chistv2()
+                                                └─ `__builtin_cce_dhistv2_m`
+                                                    └─ `CHISTv2`
        │     │     │           │     ├─ SetFlag/WaitFlag<V_S>
        │     │     │           │     └─ 二分查找 boundary  (Scalar)
        │     │     │           ├─ GatherGreaterAndEqualKData   [:579, __simd_vf__]
